@@ -26,7 +26,6 @@ tools/
 data/
 logs/
 temp/
-*.ckpt
 *.log
 
 # OS / Jupyter
