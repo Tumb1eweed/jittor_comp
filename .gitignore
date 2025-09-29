@@ -1,0 +1,34 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C/C++/CUDA extensions
+*.so
+
+# Build & packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments & env files
+.env
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Project data & artifacts
+tools/
+data/
+logs/
+temp/
+*.ckpt
+*.log
+
+# OS / Jupyter
+.DS_Store
+.ipynb_checkpoints/
