@@ -1,247 +1,99 @@
-import logging
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import pytorch3d.ops
-from pytorch3d.ops import knn_points
-import pytorch3d.loss.chamfer as cd_loss
+import json
+import os
+from pathlib import Path
+
+os.environ.setdefault("nvcc_path", "")
 import numpy as np
-from .feature import FeatureExtraction
-import pytorch_lightning as pl
-from datasets.pcl import *
-from datasets.patch import *
-from utils.misc import *
-from utils.transforms import *
-from models.utils import chamfer_distance_unit_sphere
-from models.utils import farthest_point_sampling
-from torch.cuda.amp import autocast
-from .InfoCD import *
-from models.blocks import CodebookModule
+import jittor as jt
+from jittor import nn
 
-class PGDModel(pl.LightningModule):
+from models.feature import FeatureExtraction
+from models.utils import farthest_point_sampling_jt, knn_points
 
-    def __init__(self, args):
+
+class PGDModel(nn.Module):
+    def __init__(self, args=None):
         super().__init__()
-        self.save_hyperparameters()
         self.args = args
         self.feature_nets = FeatureExtraction()
-        self.console_logger = logging.getLogger('pytorch_lightning.core')
-        
-        self.val_out = []
-        self.train_out = []
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(
-            self.feature_nets.parameters(),
-            lr=self.args.lr,
-        )
-        scheduler = {
-            'scheduler': ReduceLROnPlateau(optimizer, patience=self.args.sched_patience, factor=self.args.sched_factor,
-                                           min_lr=self.args.min_lr),
-            'interval': 'epoch',
-            'frequency': 5,
-            'monitor': 'val_loss',
-        }
-        return [optimizer], [scheduler]
+    @classmethod
+    def load_from_npz(cls, path, args=None):
+        model = cls(args=args)
+        model.load_npz(path)
+        model.eval()
+        return model
 
-    def train_dataloader(self):
-        train_dset = PairedPatchDataset(
-            datasets=[
-                PointCloudDataset(
-                    root=self.args.dataset_root,
-                    dataset=self.args.dataset,
-                    split='train',
-                    resolution=resl,
-                    transform=standard_train_transforms(noise_std_max=self.args.noise_max,
-                                                        noise_std_min=self.args.noise_min, rotate=self.args.aug_rotate)
-                ) for resl in self.args.resolutions
-            ],
-            split='train',
-            patch_size=self.args.patch_size,
-            num_patches=self.args.patches_per_shape_per_epoch,
-            patch_ratio=self.args.patch_ratio,
-            on_the_fly=True
-        )
+    def load_npz(self, path):
+        params = np.load(path)
+        state = self.feature_nets.state_dict()
+        loaded = 0
+        missing = []
+        for name, var in state.items():
+            if name not in params:
+                missing.append(name)
+                continue
+            arr = params[name]
+            if tuple(arr.shape) != tuple(var.shape):
+                raise ValueError(f"shape mismatch for {name}: npz {arr.shape}, model {tuple(var.shape)}")
+            var.assign(jt.array(arr))
+            loaded += 1
+        self._load_report = {"path": str(path), "loaded": loaded, "missing": missing}
+        return self._load_report
 
-        return DataLoader(train_dset, batch_size=self.args.train_batch_size, num_workers=8, pin_memory=True,
-                          shuffle=True)
+    def save_npz(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(path, **{k: v.numpy() for k, v in self.feature_nets.state_dict().items()})
 
-    def val_dataloader(self):
-        val_dset = PointCloudDataset(
-            root=self.args.dataset_root,
-            dataset=self.args.dataset,
-            split='test',
-            resolution=self.args.resolutions[0],
-            transform=standard_train_transforms(noise_std_max=self.args.val_noise, noise_std_min=self.args.val_noise,
-                                                rotate=False),
-        )
-
-        return DataLoader(val_dset, batch_size=self.args.val_batch_size, num_workers=8, pin_memory=True, shuffle=False)
-
-    def training_step(self, train_batch, batch_idx):
-        pcl_noisy = train_batch['pcl_noisy']
-        pcl_clean = train_batch['pcl_clean']
-        pcl_seeds = train_batch['seed_pnts']
-        pcl_std = train_batch['pcl_std']
-
-        for module in self.modules():
-            if isinstance(module, CodebookModule):
-                module.train()
-
-        main_loss, commitment_loss = self.get_supervised_loss_with_commitment(
-            pcl_noisy=pcl_noisy, pcl_clean=pcl_clean, pcl_seeds=pcl_seeds, pcl_std=pcl_std
-        )
-        
-        total_loss = main_loss + commitment_loss
-        
-        self.log('main_loss', main_loss, prog_bar=True)
-        self.log('commitment_loss', commitment_loss, prog_bar=True)
-        self.log('total_loss', total_loss, prog_bar=True)
-        
-        self.train_out.append(total_loss.item())
-        return {"loss": total_loss, "loss_as_tensor": total_loss.clone().detach()}
-
-    def validation_step(self, val_batch, batch_idx):
-        pcl_clean = val_batch['pcl_clean']
-        pcl_noisy = val_batch['pcl_noisy']
-
-        for module in self.modules():
-            if isinstance(module, CodebookModule):
-                module.eval()
-
-        all_clean = []
-        all_denoised = []
-        for i, data in enumerate(pcl_noisy):
-            pcl_denoised = self.patch_based_denoise(data, seed_k_alpha=10)  
-            all_clean.append(pcl_clean[i].unsqueeze(0))
-            all_denoised.append(pcl_denoised.unsqueeze(0))
-        
-        all_clean = torch.cat(all_clean, dim=0)
-        all_denoised = torch.cat(all_denoised, dim=0)
-
-        avg_chamfer = chamfer_distance_unit_sphere(all_denoised, all_clean, batch_reduction='mean')[0].item()
-        self.val_out.append(avg_chamfer)
-        return torch.tensor(avg_chamfer)
-
-    def on_train_epoch_end(self):
-        if self.train_out:
-            loss_all = sum(self.train_out) / len(self.train_out)
-            self.console_logger.info(f'INFO: Current epoch training loss: {loss_all:.6f}')
-            self.log('train_epoch_loss', loss_all, sync_dist=True)
-            self.train_out.clear()
-        else:
-            if self.trainer.is_global_zero:
-                self.console_logger.info('INFO: No training outputs to process.')
-        
-    def on_validation_epoch_end(self):
-        if self.val_out:
-            val_outs = torch.tensor(self.val_out, device=self.device)
-            val_loss_all = val_outs.mean()
-
-            self.console_logger.info(f'INFO: Current epoch validation loss: {val_loss_all:.6f}')
-            self.log('val_loss', val_loss_all, sync_dist=True)
-            self.val_out.clear()
-        else:
-            if self.trainer.is_global_zero:
-                self.console_logger.info('INFO: No validation outputs to process.')
-
-    def curr_iter_add_noise(self, pcl_clean, noise_std):
-        new_pcl_clean = pcl_clean + torch.randn_like(pcl_clean) * noise_std.unsqueeze(1).unsqueeze(2)
-        return new_pcl_clean.float()
-
-    def get_supervised_loss_with_commitment(self, pcl_noisy, pcl_clean, pcl_seeds, pcl_std):
-        B, N_noisy, N_clean, d = pcl_noisy.size(0), pcl_noisy.size(1), pcl_clean.size(1), pcl_noisy.size(2)
-
-        pcl_seeds_1 = pcl_seeds.repeat(1, N_noisy, 1)
-        pcl_noisy_centered = pcl_noisy - pcl_seeds_1 
-        pcl_seeds_2 = pcl_seeds.repeat(1, N_clean, 1)
-        pcl_clean_centered = pcl_clean - pcl_seeds_2 
-
-        pcl_input = pcl_noisy_centered
-
-        feat = pcl_input.reshape(B * N_noisy, -1)[:, 3:].cuda() if pcl_input.shape[-1] > 3 else None
-        offset = torch.tensor(np.array([(i + 1) * N_noisy for i in range(B)]), dtype=torch.int32).cuda() 
-        
-        pred_disp, commitment_loss = self.feature_nets(
-            pcl_input, 
-            feat, 
-            offset, 
-            calculate_commitment_losses=True 
-        )
-        
-        pred_pcl = pcl_input + pred_disp 
-        
-        main_loss = calc_cd_like_InfoV2(pred_pcl, pcl_clean_centered) 
-
-        return main_loss, commitment_loss
-
-    def patch_based_denoise(self, pcl_noisy, patch_size=1000, seed_k=5, seed_k_alpha=10):
-        assert pcl_noisy.dim() == 2, 'The shape of input point cloud must be (N, 3).'
-        N, d = pcl_noisy.size()
-        pcl_noisy = pcl_noisy.unsqueeze(0)
-        num_patches = int(seed_k * N / patch_size)
-        seed_pnts, _ = farthest_point_sampling(pcl_noisy, num_patches)
-        patch_dists, point_idxs_in_main_pcd, patches = pytorch3d.ops.knn_points(seed_pnts, pcl_noisy, K=patch_size,
-                                                                                return_nn=True)
-        patches = patches[0]
-
-        seed_pnts_1 = seed_pnts.squeeze().unsqueeze(1).repeat(1, patch_size, 1)
-        patches = patches - seed_pnts_1
-        patch_dists, point_idxs_in_main_pcd = patch_dists[0], point_idxs_in_main_pcd[0]
-        patch_dists = patch_dists / patch_dists[:, -1].unsqueeze(1).repeat(1, patch_size)
-
-        all_dists = torch.ones(num_patches, N) / 0
-        all_dists = all_dists.cuda()
-        all_dists = list(all_dists)
-        patch_dists, point_idxs_in_main_pcd = list(patch_dists), list(point_idxs_in_main_pcd)
-
-        for all_dist, patch_id, patch_dist in zip(all_dists, point_idxs_in_main_pcd, patch_dists):
-            all_dist[patch_id] = patch_dist
-
-        all_dists = torch.stack(all_dists, dim=0)
-        weights = torch.exp(-1 * all_dists)
-
-        best_weights, best_weights_idx = torch.max(weights, dim=0)
-        patches_denoised = []
-
-        i = 0
-        patch_step = int(N / (seed_k_alpha * patch_size))
-        assert patch_step > 0, "Seed_k_alpha needs to be decreased to increase patch_step!"
-        while i < num_patches:
-            curr_patches = patches[i:i + patch_step]
-            patches_denoised_temp = self.denoise_langevin_dynamics(curr_patches)
-            patches_denoised.append(patches_denoised_temp)
-            i += patch_step
-
-        patches_denoised = torch.cat(patches_denoised, dim=0)
-        patches_denoised = patches_denoised + seed_pnts_1
-
-        pcl_denoised = [patches_denoised[patch][point_idxs_in_main_pcd[patch] == pidx_in_main_pcd] for
-                        pidx_in_main_pcd, patch in enumerate(best_weights_idx)]
-
-        pcl_denoised = torch.cat(pcl_denoised, dim=0)
-
-        while pcl_denoised.shape[0] != N:
-            pcl_denoised = torch.cat((pcl_denoised, pcl_denoised[pcl_denoised.shape[0]-1].unsqueeze(0)), dim=0)
-
-        return pcl_denoised
+    def execute(self, pcl_noisy, calculate_commitment_losses=False):
+        b, n, _ = pcl_noisy.shape
+        feat = None
+        offset = jt.array(np.array([(i + 1) * n for i in range(b)], dtype=np.int32))
+        return self.feature_nets(pcl_noisy, feat, offset, calculate_commitment_losses=calculate_commitment_losses)
 
     def denoise_langevin_dynamics(self, pcl_noisy):
-        B, N, d = pcl_noisy.size()
+        pred_disp, _ = self(pcl_noisy, calculate_commitment_losses=False)
+        return pcl_noisy + pred_disp
 
-        with torch.no_grad():
-            
-            feat = pcl_noisy.reshape(B * N, -1)[:, 3:].cuda() if pcl_noisy.shape[-1] > 3 else None
-            offset = torch.tensor(np.array([(i + 1) * N for i in range(B)]), dtype=torch.int32).cuda()
-            
-            pred_disp, _ = self.feature_nets( 
-                pcl_noisy, 
-                feat, 
-                offset, 
-                calculate_commitment_losses=False 
-            )
-            
-        return pcl_noisy + pred_disp 
+    def patch_based_denoise(self, pcl_noisy, patch_size=1000, seed_k=5, seed_k_alpha=10, patch_batch_size=None):
+        pcl = pcl_noisy if isinstance(pcl_noisy, jt.Var) else jt.array(np.asarray(pcl_noisy, dtype=np.float32))
+        assert len(pcl.shape) == 2 and pcl.shape[1] == 3
+        n = pcl.shape[0]
+        num_patches = int(seed_k * n / patch_size)
+        seed = farthest_point_sampling_jt(pcl.unsqueeze(0), num_patches)[0]
+        dists, idx, patches = knn_points(seed.unsqueeze(0), pcl.unsqueeze(0), k=patch_size, return_nn=True)
+        patch_dists = dists[0]
+        point_idxs = idx[0].int64()
+        patches_centered = patches[0] - seed[:, None, :]
+        denom = jt.maximum(patch_dists[:, -1:], jt.array(1e-12, dtype=jt.float32))
+        patch_dists = patch_dists / denom
+        all_dists = jt.full((num_patches, n), 1e10, dtype=jt.float32).scatter(1, point_idxs, patch_dists)
+        best_patch = jt.argmax(-all_dists, dim=0)[0].int64()
+
+        patches_denoised = []
+        i = 0
+        patch_step = int(n / (seed_k_alpha * patch_size))
+        if patch_batch_size is not None:
+            patch_step = max(patch_step, int(patch_batch_size))
+        if patch_step <= 0:
+            raise ValueError("Seed_k_alpha needs to be decreased to increase patch_step")
+        while i < num_patches:
+            curr = patches_centered[i:i + patch_step]
+            den = self.denoise_langevin_dynamics(curr)
+            patches_denoised.append(den)
+            i += patch_step
+        patches_denoised = jt.concat(patches_denoised, dim=0) + seed[:, None, :]
+        local_ids = jt.arange(patch_size).reshape(1, patch_size).broadcast((num_patches, patch_size)).int64()
+        local_for_point = jt.zeros((num_patches, n), dtype=jt.int64).scatter(1, point_idxs, local_ids)
+        point_ids = jt.arange(n).int64()
+        selected_local = local_for_point.reshape(-1)[best_patch * n + point_ids]
+        out = patches_denoised.reshape(num_patches * patch_size, 3)[best_patch * patch_size + selected_local, :]
+        return out.float32()
 
 
+def load_metadata(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())

@@ -1,122 +1,189 @@
-import os
 import argparse
+import json
+import os
+import random
+import shutil
+from pathlib import Path
+
+os.environ.setdefault("nvcc_path", "")
+
+import numpy as np
+import jittor as jt
+from jittor import nn
 from tqdm.auto import tqdm
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
-import logging
+
+from datasets.pcl import PointCloudDataset
+from datasets.patch import PairedPatchDataset
 from models.pgd import PGDModel
 from utils.misc import get_log_dir_name_tblogger, seed_all, str_list
-import shutil
-from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.strategies import DDPStrategy
+from utils.transforms import standard_train_transforms
+
+
+def get_mpi_info():
+    if getattr(jt, "in_mpi", False):
+        return jt.mpi.world_rank(), jt.mpi.world_size(), jt.mpi.local_rank()
+    return 0, 1, 0
+
+
+def is_main_process():
+    rank, _, _ = get_mpi_info()
+    return rank == 0
+
+
+def stack_batch(items, key):
+    return jt.array(np.stack([np.asarray(item[key], dtype=np.float32) for item in items], axis=0))
+
+
+def chamfer_loss(pred, clean):
+    dist = jt.sum((pred[:, :, None, :] - clean[:, None, :, :]) ** 2, dim=-1)
+    d1 = dist.min(dim=2)
+    d2 = dist.min(dim=1)
+    return d1.mean() + d2.mean()
+
+
+def sample_batch(dataset, batch_size, rng):
+    return [dataset[rng.randrange(len(dataset))] for _ in range(batch_size)]
+
+
+def train_epoch(model, dataset, optimizer, args, epoch, steps_per_epoch):
+    model.train()
+    rank, world_size, _ = get_mpi_info()
+    rng = random.Random(args.seed + epoch * 1000003 + rank * 9176)
+    losses = []
+    pbar = tqdm(
+        range(steps_per_epoch),
+        desc=f"Train epoch {epoch:02d}",
+        disable=(rank != 0 and not args.mpi_log_all_ranks),
+    )
+    for _ in pbar:
+        batch = sample_batch(dataset, args.train_batch_size, rng)
+        noisy = stack_batch(batch, "pcl_noisy")
+        clean = stack_batch(batch, "pcl_clean")
+        seeds = stack_batch(batch, "seed_pnts")
+        noisy_centered = noisy - seeds
+        clean_centered = clean - seeds
+        pred_disp, commitment = model(noisy_centered, calculate_commitment_losses=True)
+        pred = noisy_centered + pred_disp
+        loss = chamfer_loss(pred, clean_centered) + commitment
+        optimizer.step(loss)
+        val = float(loss.numpy())
+        if world_size > 1:
+            val = float(jt.array([val]).mpi_all_reduce("mean").numpy()[0])
+        losses.append(val)
+        pbar.set_postfix(loss=f"{val:.6f}")
+    return float(np.mean(losses))
+
 
 def main(args):
+    if args.use_cuda:
+        jt.flags.use_cuda = 1
 
-    # Logging
-    local_rank = os.environ.get('LOCAL_RANK', 0)
+    rank, world_size, local_rank = get_mpi_info()
+    if args.mpi and world_size == 1:
+        raise RuntimeError("--mpi was set, but Jittor is not running inside mpirun/mpiexec")
+    if world_size > 1 and not args.mpi:
+        print("[MPI] Detected mpirun/mpiexec; enabling distributed Jittor optimizer sync.", flush=True)
 
-    if local_rank == 0:
-        log_dir_name = get_log_dir_name_tblogger(name='PGD_%s_' % (args.dataset))
-        if args.resume_from_checkpoint is None:
-            os.makedirs(os.path.join(args.log_root, log_dir_name))
-        os.environ['LOG_DIR_NAME'] = log_dir_name
-    else:
-        log_dir_name = os.environ['LOG_DIR_NAME']
+    rank_seed = args.seed + rank * 100003
+    seed_all(rank_seed)
+    np.random.seed(rank_seed)
+    random.seed(rank_seed)
+    jt.set_global_seed(args.seed)
 
-    log_dir = os.path.join(args.log_root, log_dir_name)
-    if args.resume_from_checkpoint is not None:
-        log_dir = os.path.dirname(args.resume_from_checkpoint)
-        log_dir_name = os.path.basename(log_dir)
+    log_name = args.tag or get_log_dir_name_tblogger(name=f"PGD_{args.dataset}_")
+    log_dir = Path(args.log_root) / log_name
+    if is_main_process():
+        log_dir.mkdir(parents=True, exist_ok=True)
+        for file_ in ["./models/feature.py", "./models/blocks.py", "./models/utils.py", "./models/pgd.py", "./train.py"]:
+            shutil.copyfile(file_, log_dir / Path(file_).name)
+        args_to_save = vars(args).copy()
+        args_to_save.update({"mpi_world_size": world_size, "mpi_rank": rank, "mpi_local_rank": local_rank})
+        with open(log_dir / "args.json", "w") as f:
+            json.dump(args_to_save, f, indent=2)
+    if world_size > 1:
+        jt.sync_all()
+    print(f"[MPI] rank={rank} local_rank={local_rank} world_size={world_size}", flush=True)
 
-    if args.resume_from_checkpoint is None:
-        files_to_save = ['./models/feature.py', './models/blocks.py','./models/utils.py', './models/pgd.py','./models/InfoCD.py']
-        for file_ in files_to_save:
-            shutil.copyfile(file_, os.path.join(log_dir, os.path.basename(file_)))
-            
-    # configure logging on module level, redirect to file
-    logger = logging.getLogger('pytorch_lightning.core')
-    logger.addHandler(logging.FileHandler(os.path.join(log_dir, 'run.log')))
+    train_dset = PairedPatchDataset(
+        datasets=[
+            PointCloudDataset(
+                root=args.dataset_root,
+                dataset=args.dataset,
+                split="train",
+                resolution=resl,
+                transform=standard_train_transforms(
+                    noise_std_max=args.noise_max,
+                    noise_std_min=args.noise_min,
+                    rotate=args.aug_rotate,
+                ),
+                max_shapes=args.max_shapes,
+            )
+            for resl in args.resolutions
+        ],
+        split="train",
+        patch_size=args.patch_size,
+        num_patches=args.patches_per_shape_per_epoch,
+        patch_ratio=args.patch_ratio,
+        on_the_fly=True,
+    )
 
-    # Model
-    logger.info('INFO: Building model...')
     model = PGDModel(args)
+    if args.init_from_weights:
+        report = model.load_npz(args.init_from_weights)
+        if is_main_process():
+            print("Initialized from", report)
+    if world_size > 1 and args.mpi_sync_initial_params:
+        model.mpi_param_broadcast()
+    optimizer = nn.Adam(model.parameters(), lr=args.lr)
 
-    for k, v in vars(args).items():
-        logger.info('[ARGS::%s] %s' % (k, repr(v)))
+    steps_per_epoch = args.steps_per_epoch
+    if steps_per_epoch <= 0:
+        steps_per_epoch = max(1, len(train_dset) // args.train_batch_size)
+    if world_size > 1 and args.mpi_scale_steps_by_world_size:
+        steps_per_epoch = max(1, steps_per_epoch // world_size)
 
-    logger.info(repr(model))
-
-    # Main loop
-    try:
-        logger.info('INFO: Start training...')
-        # seed_everything(args.seed, workers=True)
-        lr_monitor = LearningRateMonitor(logging_interval='step')
-        strategy = DDPStrategy()
-        trainer = Trainer(
-            accelerator='gpu',
-            precision='16-mixed',
-            devices=args.n_gpu,
-            num_nodes=1,
-            logger=TensorBoardLogger(args.log_root, name=log_dir_name),
-            deterministic=False,
-            max_epochs=800,
-            check_val_every_n_epoch=args.save_interval,
-            callbacks=[
-                        ModelCheckpoint(
-                             monitor='val_loss',
-                             every_n_epochs=args.save_interval, 
-                             save_on_train_epoch_end=False,
-                             save_top_k = -1,
-                             dirpath=log_dir,
-                            filename='pgd-epoch{epoch:02d}-val_loss{val_loss:.8f}',
-                             auto_insert_metric_name=False
-                        ),
-                        lr_monitor,  
-                    ],
-            strategy=strategy
-        )
-        trainer.fit(model, ckpt_path=args.resume_from_checkpoint)
-    except KeyboardInterrupt:
-        logger.info('INFO: Terminating...')
-        print('Terminating...')
+    history = []
+    for epoch in range(args.max_epochs):
+        loss = train_epoch(model, train_dset, optimizer, args, epoch, steps_per_epoch)
+        history.append({"epoch": epoch, "loss": loss})
+        if is_main_process():
+            print(f"[Epoch {epoch:02d}] loss={loss:.8f}")
+        if is_main_process() and ((epoch + 1) % args.save_interval == 0 or epoch + 1 == args.max_epochs):
+            ckpt = log_dir / f"pgd-jittor-epoch{epoch:02d}-loss{loss:.8f}.npz"
+            model.save_npz(ckpt)
+            with open(log_dir / "history.json", "w") as f:
+                json.dump(history, f, indent=2)
+        if world_size > 1:
+            jt.sync_all()
 
 
-if __name__ == '__main__':
-    # Arguments
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    ## Dataset and loader
-    parser.add_argument('--dataset_root', type=str, default='./data')
-    parser.add_argument('--dataset', type=str, default='PUNet')
-    parser.add_argument('--patches_per_shape_per_epoch', type=int, default=1000)
-    parser.add_argument('--patch_ratio', type=float, default=1.0)
-    parser.add_argument('--resolutions', type=str_list, default=['10000_poisson', '30000_poisson', '50000_poisson'], choices=[['x0000_poisson'], ['x0000_poisson', 'y0000_poisson'], ['x0000_poisson', 'y0000_poisson', 'z0000_poisson']])
-    parser.add_argument('--noise_min', type=float, default=0.005)
-    parser.add_argument('--noise_max', type=float, default=0.02)
-    parser.add_argument('--train_batch_size', type=int, default=20)
-    parser.add_argument('--val_batch_size', type=int, default=20)
- 
-    parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--save_interval', type=int, default=5)
-    parser.add_argument('--aug_rotate', type=eval, default=True, choices=[True, False])
-
-    ## Optimizer and scheduler
-    parser.add_argument('--sched_patience', default=2, type=int, help='Ierativative scheduler patience')
-    parser.add_argument('--sched_factor', default=0.5, type=float)
-    parser.add_argument('--min_lr', default=1e-9, type=float)  
-    parser.add_argument('--lr', type=float, default=5e-4)
-
-    ## Training
-    parser.add_argument('--seed', type=int, default=2025)
-    parser.add_argument('--log_root', type=str, default='./logs/PGD')
-    parser.add_argument('--val_noise', type=float, default=0.015)
-    parser.add_argument('--resume_from_checkpoint', type=str, default=None)
-
-    # Ablation parameters
-    parser.add_argument('--patch_size', type=int, default=1000)
-
+    parser.add_argument("--dataset_root", type=str, default="./data")
+    parser.add_argument("--dataset", type=str, default="PUNet")
+    parser.add_argument("--patches_per_shape_per_epoch", type=int, default=1000)
+    parser.add_argument("--patch_ratio", type=float, default=1.0)
+    parser.add_argument("--resolutions", type=str_list, default=["10000_poisson", "30000_poisson", "50000_poisson"])
+    parser.add_argument("--noise_min", type=float, default=0.005)
+    parser.add_argument("--noise_max", type=float, default=0.02)
+    parser.add_argument("--train_batch_size", type=int, default=20)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--save_interval", type=int, default=5)
+    parser.add_argument("--aug_rotate", type=eval, default=True, choices=[True, False])
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument("--log_root", type=str, default="./logs/PGD")
+    parser.add_argument("--max_epochs", type=int, default=800)
+    parser.add_argument("--steps_per_epoch", type=int, default=0)
+    parser.add_argument("--patch_size", type=int, default=1000)
+    parser.add_argument("--init_from_weights", type=str, default=None)
+    parser.add_argument("--tag", type=str, default=None)
+    parser.add_argument("--use_cuda", action="store_true")
+    parser.add_argument("--max_shapes", type=int, default=0)
+    parser.add_argument("--mpi", action="store_true")
+    parser.add_argument("--mpi_log_all_ranks", action="store_true")
+    parser.add_argument("--mpi_sync_initial_params", action="store_true", default=True)
+    parser.add_argument("--no_mpi_sync_initial_params", dest="mpi_sync_initial_params", action="store_false")
+    parser.add_argument("--mpi_scale_steps_by_world_size", action="store_true")
     args = parser.parse_args()
-    args.n_gpu = [0, 1]
-    
-    seed_all(args.seed)
     main(args)

@@ -1,5 +1,4 @@
 import os
-import torch
 import numpy as np
 import random
 import time
@@ -8,7 +7,6 @@ import logging.handlers
 
 
 def seed_all(seed):
-    torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
@@ -42,13 +40,7 @@ def get_logger(name, log_dir=None):
 
 
 def log_hyperparams(writer, log_dir, args):
-    from torch.utils.tensorboard.summary import hparams
     vars_args = {k:v if isinstance(v, str) else repr(v) for k, v in vars(args).items()}
-    exp, ssi, sei = hparams(vars_args, {"hp_metric": -1})
-    fw = writer._get_file_writer()
-    fw.add_summary(exp)
-    fw.add_summary(ssi)
-    fw.add_summary(sei)
     with open(os.path.join(log_dir, 'hparams.csv'), 'w') as csvf:
         csvf.write('key,value\n')
         for k, v in vars_args.items():

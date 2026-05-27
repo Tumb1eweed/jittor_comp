@@ -22,11 +22,14 @@ env/
 .idea/
 
 # Project data & artifacts
-tools/
 data/
 logs/
 temp/
+weights/
 *.log
+
+# Tool runtime cache
+tools/__pycache__/
 
 # OS / Jupyter
 .DS_Store

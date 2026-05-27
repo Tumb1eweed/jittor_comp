@@ -1,93 +1,131 @@
-import torch
-import pytorch3d.loss
-import pytorch3d.structures
-from torch_cluster import fps
+import numpy as np
+import os
+os.environ.setdefault("nvcc_path", "")
+import jittor as jt
+
 
 def normalize_sphere(pc, radius=1.0):
-    """
-    Args:
-        pc: A batch of point clouds, (B, N, 3).
-    """
-    ## Center
-    p_max = pc.max(dim=-2, keepdim=True)[0]
-    p_min = pc.min(dim=-2, keepdim=True)[0]
-    center = (p_max + p_min) / 2    # (B, 1, 3)
+    p_max = pc.max(dim=-2, keepdims=True)
+    p_min = pc.min(dim=-2, keepdims=True)
+    center = (p_max + p_min) / 2
     pc = pc - center
-    ## Scale
-    scale = (pc ** 2).sum(dim=-1, keepdim=True).sqrt().max(dim=-2, keepdim=True)[0] / radius  # (B, N, 1)
-    pc = pc / scale
-    return pc, center, scale
+    scale = jt.sqrt(jt.sum(pc ** 2, dim=-1, keepdims=True)).max(dim=-2, keepdims=True) / radius
+    return pc / scale, center, scale
+
 
 def normalize_pcl(pc, center, scale):
     return (pc - center) / scale
 
+
 def denormalize_pcl(pc, center, scale):
     return pc * scale + center
 
-def chamfer_distance_unit_sphere(gen, ref, batch_reduction='mean', point_reduction='mean'):
-    ref, center, scale = normalize_sphere(ref)
-    gen = normalize_pcl(gen, center, scale)
-    return pytorch3d.loss.chamfer_distance(gen, ref, batch_reduction=batch_reduction, point_reduction=point_reduction)
 
-def farthest_point_sampling(pcls, num_pnts):
-    """
-    Args:
-        pcls:  A batch of point clouds, (B, N, 3).
-        num_pnts:  Target number of points.
-    """
-    ratio = 0.01 + num_pnts / pcls.size(1)
+def knn_points(p1, p2, k=1, return_nn=False):
+    p1 = p1 if isinstance(p1, jt.Var) else jt.array(np.asarray(p1, dtype=np.float32))
+    p2 = p2 if isinstance(p2, jt.Var) else jt.array(np.asarray(p2, dtype=np.float32))
+    kk = min(k, p2.shape[1])
+    all_d = []
+    all_idx = []
+    all_nn = []
+    for b in range(p1.shape[0]):
+        diff = p1[b:b + 1].transpose(0, 1) - p2[b:b + 1]
+        dist = jt.sum(diff * diff, dim=-1)
+        vals, idx = jt.topk(-dist, kk, dim=1)
+        vals = -vals
+        if kk < k:
+            pad_idx = idx[:, -1:].broadcast((idx.shape[0], k - kk))
+            pad_vals = vals[:, -1:].broadcast((vals.shape[0], k - kk))
+            idx = jt.concat([idx, pad_idx], dim=1)
+            vals = jt.concat([vals, pad_vals], dim=1)
+        all_d.append(vals.unsqueeze(0))
+        all_idx.append(idx.int64().unsqueeze(0))
+        if return_nn:
+            nn = p2[b][idx.reshape(-1).int64(), :].reshape(idx.shape[0], idx.shape[1], p2.shape[-1])
+            all_nn.append(nn.unsqueeze(0))
+    d = jt.concat(all_d, dim=0)
+    idx = jt.concat(all_idx, dim=0)
+    if return_nn:
+        return d, idx, jt.concat(all_nn, dim=0)
+    return d, idx
+
+
+def knn_points_np(p1, p2, k=1, return_nn=False):
+    d, idx, *rest = knn_points(p1, p2, k=k, return_nn=return_nn)
+    d_np = d.numpy().astype(np.float32)
+    idx_np = idx.numpy().astype(np.int64)
+    if return_nn:
+        return d_np, idx_np, rest[0].numpy().astype(np.float32)
+    return d_np, idx_np
+
+
+def _farthest_point_sampling_one(pts, num_pnts):
+    n = pts.shape[0]
+    m = min(int(num_pnts), n)
+    selected = []
+    dist = jt.full((n,), 1e10, dtype=jt.float32)
+    farthest = 0
+    for _ in range(m):
+        selected.append(farthest)
+        delta = pts - pts[farthest:farthest + 1]
+        dist = jt.minimum(dist, jt.sum(delta * delta, dim=1))
+        farthest = int(jt.argmax(dist, dim=0)[0].item())
+    return jt.array(np.asarray(selected, dtype=np.int64)).int64()
+
+
+def farthest_point_sampling_jt(pcls, num_pnts, return_index=False):
+    pcls = pcls if isinstance(pcls, jt.Var) else jt.array(np.asarray(pcls, dtype=np.float32))
     sampled = []
     indices = []
-    for i in range(pcls.size(0)): #pcls.size(0)=B
-        idx = fps(pcls[i], ratio=ratio, random_start=False)[:num_pnts]
-        sampled.append(pcls[i:i+1, idx, :])
-        indices.append(idx)
-    sampled = torch.cat(sampled, dim=0)
-    return sampled, indices
-
-def point_mesh_bidir_distance_single_unit_sphere(pcl, verts, faces):
-    """
-    Args:
-        pcl:    (N, 3).
-        verts:  (M, 3).
-        faces:  LongTensor, (T, 3).
-    Returns:
-        Squared pointwise distances, (N, ).
-    """
-    assert pcl.dim() == 2 and verts.dim() == 2 and faces.dim() == 2, 'Batch is not supported.'
-    
-    # Normalize mesh
-    verts, center, scale = normalize_sphere(verts.unsqueeze(0))
-    verts = verts[0]
-    # Normalize pcl
-    pcl = normalize_pcl(pcl.unsqueeze(0), center=center, scale=scale)
-    pcl = pcl[0]
-
-    # Convert them to pytorch3d structures
-    pcls = pytorch3d.structures.Pointclouds([pcl])
-    meshes = pytorch3d.structures.Meshes([verts], [faces])
-    return pytorch3d.loss.point_mesh_face_distance(meshes, pcls)
+    for b in range(pcls.shape[0]):
+        idx = _farthest_point_sampling_one(pcls[b], num_pnts)
+        sampled.append(pcls[b][idx, :].unsqueeze(0))
+        indices.append(idx.unsqueeze(0))
+    sampled = jt.concat(sampled, dim=0)
+    indices = jt.concat(indices, dim=0)
+    if return_index:
+        return sampled, indices
+    return sampled
 
 
- 
+def knn_points_np_legacy(p1, p2, k=1, return_nn=False):
+    from scipy.spatial import cKDTree
+    kk = min(k, p2.shape[1])
+    all_idx = []
+    all_d = []
+    for b in range(p1.shape[0]):
+        d, idx = cKDTree(p2[b]).query(p1[b], k=kk)
+        if kk == 1:
+            d = d[:, None]
+            idx = idx[:, None]
+        all_idx.append(idx.astype(np.int64))
+        all_d.append((d * d).astype(np.float32))
+    idx = np.stack(all_idx, axis=0)
+    d = np.stack(all_d, axis=0)
+    if kk < k:
+        idx = np.concatenate([idx, np.repeat(idx[:, :, -1:], k - kk, axis=2)], axis=2)
+        d = np.concatenate([d, np.repeat(d[:, :, -1:], k - kk, axis=2)], axis=2)
+    if return_nn:
+        nn = np.stack([p2[b][idx[b]] for b in range(p1.shape[0])], axis=0)
+        return d.astype(np.float32), idx.astype(np.int64), nn.astype(np.float32)
+    return d.astype(np.float32), idx.astype(np.int64)
 
 
-def hausdorff_distance_unit_sphere(gen, ref):
-    """
-    Args:
-        gen:    (B, N, 3)
-        ref:    (B, N, 3)
-    Returns:
-        (B, )
-    """
-    ref, center, scale = normalize_sphere(ref)
-    gen = normalize_pcl(gen, center, scale)
+def chamfer_distance_unit_sphere(gen, ref, batch_reduction="mean", point_reduction="mean"):
+    gen_np = gen.numpy() if isinstance(gen, jt.Var) else np.asarray(gen)
+    ref_np = ref.numpy() if isinstance(ref, jt.Var) else np.asarray(ref)
+    ref_jt, center, scale = normalize_sphere(jt.array(ref_np.astype(np.float32)))
+    gen_jt = normalize_pcl(jt.array(gen_np.astype(np.float32)), center, scale)
+    gen_np = gen_jt.numpy()
+    ref_np = ref_jt.numpy()
+    d1, _ = knn_points_np(gen_np, ref_np, k=1)
+    d2, _ = knn_points_np(ref_np, gen_np, k=1)
+    cd = d1[:, :, 0].mean(axis=1) + d2[:, :, 0].mean(axis=1)
+    if batch_reduction == "mean":
+        return jt.array(cd.mean()), None
+    return jt.array(cd), None
 
-    dists_ab, _, _ = pytorch3d.ops.knn_points(ref, gen, K=1)
-    dists_ab = dists_ab[:,:,0].max(dim=1, keepdim=True)[0]  # (B, 1)
-    dists_ba, _, _ = pytorch3d.ops.knn_points(gen, ref, K=1)
-    dists_ba = dists_ba[:,:,0].max(dim=1, keepdim=True)[0]  # (B, 1)
-    
-    dists_hausdorff = torch.max(torch.cat([dists_ab, dists_ba], dim=1), dim=1)[0]
 
-    return dists_hausdorff
+def farthest_point_sampling(pcls, num_pnts):
+    sampled, idx = farthest_point_sampling_jt(pcls, num_pnts, return_index=True)
+    return sampled.numpy().astype(np.float32), [v for v in idx.numpy().astype(np.int64)]
