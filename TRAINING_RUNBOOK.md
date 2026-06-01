@@ -69,7 +69,7 @@ The script:
 4. Normalizes each point cloud into a unit sphere.
 5. Adds fixed `2.5%` Gaussian noise (`noise_std=0.025`).
 6. Builds one `1000`-point local patch per mesh sample.
-7. Trains `PGDModel` with Chamfer loss for one epoch.
+7. Trains `PGDModel` with InfoCD loss for one epoch.
 8. Runs validation on the validate split and saves an `.npz` checkpoint.
 
 Current command:
@@ -84,9 +84,14 @@ python3.7 tools/train_shapenet_one_epoch.py \
   --noise_std 0.025 \
   --patch_size 1000 \
   --batch_size 8 \
+  --loss infocd \
   --epochs 1 \
   --log_dir /home/PGD/experiments/shapenet_10k_gaussian_025_one_epoch
 ```
+
+`--loss infocd` is the default. `--loss chamfer` is kept only as an explicit
+fallback/debug option. The InfoCD implementation is in `models/InfoCD.py` and
+uses Jittor tensor operations only.
 
 The current run was started in the background with:
 

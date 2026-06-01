@@ -18,6 +18,7 @@ import jittor as jt
 from jittor import nn
 from tqdm.auto import tqdm
 
+from models.InfoCD import calc_cd_like_InfoV2
 from models.pgd import PGDModel
 
 
@@ -127,13 +128,21 @@ def chamfer_loss(pred, clean):
     return d1.mean() + d2.mean()
 
 
+def get_loss_fn(name):
+    if name == "infocd":
+        return calc_cd_like_InfoV2
+    if name == "chamfer":
+        return chamfer_loss
+    raise ValueError("unsupported loss: {}".format(name))
+
+
 def stack_batch(samples):
     noisy = jt.array(np.stack([s[0] for s in samples], axis=0))
     clean = jt.array(np.stack([s[1] for s in samples], axis=0))
     return noisy, clean
 
 
-def run_epoch(model, dataset, optimizer, batch_size, train=True, desc="train"):
+def run_epoch(model, dataset, optimizer, batch_size, loss_fn, train=True, desc="train"):
     indices = list(range(len(dataset)))
     if train:
         random.shuffle(indices)
@@ -148,7 +157,7 @@ def run_epoch(model, dataset, optimizer, batch_size, train=True, desc="train"):
         samples = [dataset[i] for i in batch_idx]
         noisy, clean = stack_batch(samples)
         pred = noisy + model(noisy)
-        loss = chamfer_loss(pred, clean)
+        loss = loss_fn(pred, clean)
         if train:
             optimizer.step(loss)
         val = float(loss.numpy())
@@ -168,6 +177,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--loss", choices=["infocd", "chamfer"], default="infocd")
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--use_cuda", action="store_true")
     parser.add_argument("--max_train_shapes", type=int, default=0)
@@ -206,15 +216,17 @@ def main():
     )
     print("train shapes: {}, val shapes: {}".format(len(train_set), len(val_set)), flush=True)
     print("sample_points: {}, gaussian noise std: {}".format(args.sample_points, args.noise_std), flush=True)
+    print("loss: {}".format(args.loss), flush=True)
 
     model = PGDModel(args)
     optimizer = nn.Adam(model.parameters(), lr=args.lr)
+    loss_fn = get_loss_fn(args.loss)
 
     history = []
     for epoch in range(args.epochs):
         t0 = time.time()
-        train_loss = run_epoch(model, train_set, optimizer, args.batch_size, train=True, desc="train epoch {:02d}".format(epoch))
-        val_loss = run_epoch(model, val_set, optimizer, args.batch_size, train=False, desc="val epoch {:02d}".format(epoch))
+        train_loss = run_epoch(model, train_set, optimizer, args.batch_size, loss_fn, train=True, desc="train epoch {:02d}".format(epoch))
+        val_loss = run_epoch(model, val_set, optimizer, args.batch_size, loss_fn, train=False, desc="val epoch {:02d}".format(epoch))
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
