@@ -24,6 +24,7 @@ env/
 # Project data & artifacts
 data/
 logs/
+experiments/
 temp/
 weights/
 *.log
