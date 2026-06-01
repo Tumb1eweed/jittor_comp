@@ -83,7 +83,7 @@ python3.7 tools/train_shapenet_one_epoch.py \
   --sample_points 10000 \
   --noise_std 0.025 \
   --patch_size 1000 \
-  --batch_size 8 \
+  --batch_size 24 \
   --loss infocd \
   --epochs 1 \
   --log_dir /home/PGD/experiments/shapenet_10k_gaussian_025_one_epoch
@@ -96,7 +96,7 @@ uses Jittor tensor operations only.
 The current run was started in the background with:
 
 ```bash
-setsid bash -c 'cd /home/PGD; exec python3.7 tools/train_shapenet_one_epoch.py --use_cuda --dataset_root /home/dataset_train --datalist_dir /home/PGD/datalist --sample_points 10000 --noise_std 0.025 --patch_size 1000 --batch_size 8 --epochs 1 --log_dir /home/PGD/experiments/shapenet_10k_gaussian_025_one_epoch >> /home/PGD/experiments/shapenet_10k_gaussian_025_one_epoch/train.log 2>&1' &
+setsid bash -c 'cd /home/PGD; exec python3.7 tools/train_shapenet_one_epoch.py --use_cuda --dataset_root /home/dataset_train --datalist_dir /home/PGD/datalist --sample_points 10000 --noise_std 0.025 --patch_size 1000 --batch_size 24 --loss infocd --epochs 1 --log_dir /home/PGD/experiments/shapenet_10k_gaussian_025_one_epoch >> /home/PGD/experiments/shapenet_10k_gaussian_025_one_epoch/train.log 2>&1' &
 ```
 
 Runtime artifacts are intentionally ignored by git:
