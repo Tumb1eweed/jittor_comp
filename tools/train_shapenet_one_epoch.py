@@ -98,7 +98,18 @@ def make_patch(clean, noisy, patch_size):
 
 
 class ShapeNetPatchDataset:
-    def __init__(self, dataset_root, split_file, data_name, sample_points, patch_size, noise_std, max_shapes=0):
+    def __init__(
+        self,
+        dataset_root,
+        split_file,
+        data_name,
+        sample_points,
+        patch_size,
+        noise_std,
+        noise_std_min=None,
+        noise_std_max=None,
+        max_shapes=0,
+    ):
         self.dataset_root = Path(dataset_root)
         self.items = read_split(split_file)
         if max_shapes > 0:
@@ -107,6 +118,13 @@ class ShapeNetPatchDataset:
         self.sample_points = sample_points
         self.patch_size = patch_size
         self.noise_std = noise_std
+        self.noise_std_min = noise_std_min
+        self.noise_std_max = noise_std_max
+
+    def sample_noise_std(self):
+        if self.noise_std_min is None or self.noise_std_max is None:
+            return self.noise_std
+        return float(np.random.uniform(self.noise_std_min, self.noise_std_max))
 
     def __len__(self):
         return len(self.items)
@@ -116,7 +134,8 @@ class ShapeNetPatchDataset:
         path = self.dataset_root / rel / self.data_name
         vertices, faces = load_obj_mesh(path)
         clean = normalize_unit_sphere(sample_mesh(vertices, faces, self.sample_points))
-        noisy = clean + np.random.normal(0.0, self.noise_std, size=clean.shape).astype(np.float32)
+        noise_std = self.sample_noise_std()
+        noisy = clean + np.random.normal(0.0, noise_std, size=clean.shape).astype(np.float32)
         patch_noisy, patch_clean = make_patch(clean, noisy, self.patch_size)
         return patch_noisy.astype(np.float32), patch_clean.astype(np.float32), str(path)
 
@@ -173,6 +192,8 @@ def main():
     parser.add_argument("--data_name", default="models/model_normalized.obj")
     parser.add_argument("--sample_points", type=int, default=10000)
     parser.add_argument("--noise_std", type=float, default=0.025)
+    parser.add_argument("--noise_std_min", type=float, default=None)
+    parser.add_argument("--noise_std_max", type=float, default=None)
     parser.add_argument("--patch_size", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
@@ -203,6 +224,8 @@ def main():
         args.sample_points,
         args.patch_size,
         args.noise_std,
+        noise_std_min=args.noise_std_min,
+        noise_std_max=args.noise_std_max,
         max_shapes=args.max_train_shapes,
     )
     val_set = ShapeNetPatchDataset(
@@ -212,10 +235,22 @@ def main():
         args.sample_points,
         args.patch_size,
         args.noise_std,
+        noise_std_min=args.noise_std_min,
+        noise_std_max=args.noise_std_max,
         max_shapes=args.max_val_shapes,
     )
     print("train shapes: {}, val shapes: {}".format(len(train_set), len(val_set)), flush=True)
-    print("sample_points: {}, gaussian noise std: {}".format(args.sample_points, args.noise_std), flush=True)
+    if args.noise_std_min is not None and args.noise_std_max is not None:
+        print(
+            "sample_points: {}, gaussian noise std range: [{}, {}]".format(
+                args.sample_points,
+                args.noise_std_min,
+                args.noise_std_max,
+            ),
+            flush=True,
+        )
+    else:
+        print("sample_points: {}, gaussian noise std: {}".format(args.sample_points, args.noise_std), flush=True)
     print("loss: {}".format(args.loss), flush=True)
 
     model = PGDModel(args)

@@ -62,9 +62,9 @@ def train_epoch(model, dataset, optimizer, args, epoch, steps_per_epoch):
         seeds = stack_batch(batch, "seed_pnts")
         noisy_centered = noisy - seeds
         clean_centered = clean - seeds
-        pred_disp, commitment = model(noisy_centered, calculate_commitment_losses=True)
+        pred_disp = model(noisy_centered)
         pred = noisy_centered + pred_disp
-        loss = chamfer_loss(pred, clean_centered) + commitment
+        loss = chamfer_loss(pred, clean_centered)
         optimizer.step(loss)
         val = float(loss.numpy())
         if world_size > 1:
@@ -120,11 +120,8 @@ def main(args):
             )
             for resl in args.resolutions
         ],
-        split="train",
         patch_size=args.patch_size,
         num_patches=args.patches_per_shape_per_epoch,
-        patch_ratio=args.patch_ratio,
-        on_the_fly=True,
     )
 
     model = PGDModel(args)
@@ -162,12 +159,10 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_root", type=str, default="./data")
     parser.add_argument("--dataset", type=str, default="PUNet")
     parser.add_argument("--patches_per_shape_per_epoch", type=int, default=1000)
-    parser.add_argument("--patch_ratio", type=float, default=1.0)
     parser.add_argument("--resolutions", type=str_list, default=["10000_poisson", "30000_poisson", "50000_poisson"])
     parser.add_argument("--noise_min", type=float, default=0.005)
     parser.add_argument("--noise_max", type=float, default=0.02)
     parser.add_argument("--train_batch_size", type=int, default=20)
-    parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--save_interval", type=int, default=5)
     parser.add_argument("--aug_rotate", type=eval, default=True, choices=[True, False])
     parser.add_argument("--lr", type=float, default=5e-4)

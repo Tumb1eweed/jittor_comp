@@ -83,14 +83,6 @@ def queryandgroup(nsample, xyz, new_xyz, feat, idx, offset, new_offset, use_xyz=
     return out
 
 
-def queryandgroup2(nsample, xyz, new_xyz, feat, idx, offset, new_offset):
-    if idx is None:
-        idx, _ = knnquery(nsample, xyz, new_xyz, offset, new_offset)
-    idx = idx.int64()
-    out = feat[idx.reshape(-1), :].reshape(idx.shape[0], idx.shape[1], feat.shape[1])
-    return out, idx.int32()
-
-
 def interpolation(xyz, new_xyz, feat, offset, new_offset, k=3):
     idx, dist = knnquery(k, xyz, new_xyz, offset, new_offset)
     idx = idx.int64()

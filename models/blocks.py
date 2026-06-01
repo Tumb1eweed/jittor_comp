@@ -47,7 +47,7 @@ class Downsampling(nn.Module):
 
 
 class RFE(nn.Module):
-    def __init__(self, d_in, d_out):
+    def __init__(self, d_out):
         super().__init__()
         self.BiMLP = nn.Sequential(
             nn.Conv1d(10, 2 * d_out, 1),
@@ -75,8 +75,8 @@ class MRE(nn.Module):
         self.mlp0 = nn.Sequential(nn.Linear(d_in, d_out // 2), nn.BatchNorm1d(d_out // 2), nn.ReLU())
         self.mlp1 = nn.Sequential(nn.Linear(d_out, d_out), nn.BatchNorm1d(d_out), nn.ReLU())
         self.mlp01 = nn.Sequential(nn.Linear(d_in, d_out), nn.BatchNorm1d(d_out), nn.ReLU())
-        self.Rfe_1 = RFE(d_out // 2, d_out // 2)
-        self.Rfe_2 = RFE(d_out // 2, d_out // 2)
+        self.Rfe_1 = RFE(d_out // 2)
+        self.Rfe_2 = RFE(d_out // 2)
 
     def execute(self, p, x, o):
         x_start = x
@@ -108,14 +108,13 @@ class Upsampling(nn.Module):
     def U_function(self, x1, x2_interpolated):
         return self.linear_upsample(jt.concat([x1, x2_interpolated], dim=-1))
 
-    def execute(self, p1, x1, o1, idx, p2, x2, o2, batch_size=5, codebook=None, calculate_commitment_loss_for_block=False):
+    def execute(self, p1, x1, o1, idx, p2, x2, o2, batch_size=5, codebook=None):
         num_points = p1.shape[0] // batch_size
         num_points_sparse = p2.shape[0] // batch_size
         x2_interpolated = pointops.interpolation(p2, p1, x2, o2, o1, k=8)
         u_query = self.U_function(x1, x2_interpolated)
-        block_loss = jt.array(0.0, dtype=jt.float32)
         if codebook is not None:
-            x1, block_loss = codebook(x1, calculate_commitment_loss=calculate_commitment_loss_for_block)
+            x1 = codebook(x1)
         x1_enhance = self.CrossPT_func(
             u_query.reshape(batch_size, num_points, -1),
             x2.reshape(batch_size, num_points_sparse, -1),
@@ -125,7 +124,7 @@ class Upsampling(nn.Module):
             x1.reshape(batch_size, num_points, -1),
         ).reshape(batch_size * num_points, -1)
         x = self.mlp(jt.concat([x1_enhance, x1], dim=-1))
-        return p1, x, o1, block_loss
+        return p1, x, o1
 
 
 class CrossAttentionPointTransformerLayer(nn.Module):
@@ -155,10 +154,10 @@ class CrossAttentionPointTransformerLayer(nn.Module):
             rel = pos[:, :, None, :] - pos[:, None, :, :]
             dist = jt.norm(rel, dim=-1)
             _, indices = jt.topk(-dist, self.num_neighbors, dim=2)
-            v = batched_index_select(v, indices, dim=1)
-            k = batched_index_select(k, indices, dim=1)
+            v = batched_index_select(v, indices)
+            k = batched_index_select(k, indices)
             qk_rel = q[:, :, None] - k
-            x_e = batched_index_select(x_e, indices, dim=1)
+            x_e = batched_index_select(x_e, indices)
         else:
             qk_rel = q[:, :, None] - k[:, None, :, :]
         v = v + x_e
@@ -168,7 +167,7 @@ class CrossAttentionPointTransformerLayer(nn.Module):
         return jt.sum(attn * v, dim=2)
 
 
-def batched_index_select(values, indices, dim=1):
+def batched_index_select(values, indices):
     outs = []
     for b in range(values.shape[0]):
         flat = indices[b].reshape(-1).int64()
@@ -178,20 +177,12 @@ def batched_index_select(values, indices, dim=1):
 
 
 class CodebookModule(nn.Module):
-    def __init__(self, feature_dim=48, codebook_size=128, momentum=0.99, commitment_cost=0, use_ema=True, temperature=0.1):
+    def __init__(self, feature_dim=48, codebook_size=128, temperature=0.1):
         super().__init__()
         self.feature_dim = feature_dim
         self.codebook_size = codebook_size
-        self.momentum = momentum
-        self.commitment_cost = commitment_cost
-        self.use_ema = use_ema
         self.temperature = temperature
         self.codebook = jt.randn((codebook_size, feature_dim))
-        self.cluster_size = jt.zeros((codebook_size,))
-        self.cluster_sum = jt.zeros((codebook_size, feature_dim))
-        self.usage_count = jt.zeros((codebook_size,))
-        self.last_usage = jt.zeros((codebook_size,))
-        self.step_counter = jt.zeros((1,), dtype=jt.int64)
 
     def soft_quantize(self, features):
         features_norm = features / (jt.norm(features, dim=1, keepdims=True) + 1e-8)
@@ -202,9 +193,9 @@ class CodebookModule(nn.Module):
         indices = jt.argmax(similarity, dim=1)
         return quantized, indices, weights
 
-    def execute(self, features, calculate_commitment_loss=False):
+    def execute(self, features):
         quantized, _, _ = self.soft_quantize(features)
-        return quantized, jt.array(0.0, dtype=jt.float32)
+        return quantized
 
 
 class FiLMLayer(nn.Module):

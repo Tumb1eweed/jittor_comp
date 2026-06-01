@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 
@@ -46,14 +45,14 @@ class PGDModel(nn.Module):
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, **{k: v.numpy() for k, v in self.feature_nets.state_dict().items()})
 
-    def execute(self, pcl_noisy, calculate_commitment_losses=False):
+    def execute(self, pcl_noisy):
         b, n, _ = pcl_noisy.shape
         feat = None
         offset = jt.array(np.array([(i + 1) * n for i in range(b)], dtype=np.int32))
-        return self.feature_nets(pcl_noisy, feat, offset, calculate_commitment_losses=calculate_commitment_losses)
+        return self.feature_nets(pcl_noisy, feat, offset)
 
     def denoise_langevin_dynamics(self, pcl_noisy):
-        pred_disp, _ = self(pcl_noisy, calculate_commitment_losses=False)
+        pred_disp = self(pcl_noisy)
         return pcl_noisy + pred_disp
 
     def patch_based_denoise(self, pcl_noisy, patch_size=1000, seed_k=5, seed_k_alpha=10, patch_batch_size=None):
@@ -90,10 +89,3 @@ class PGDModel(nn.Module):
         selected_local = local_for_point.reshape(-1)[best_patch * n + point_ids]
         out = patches_denoised.reshape(num_patches * patch_size, 3)[best_patch * patch_size + selected_local, :]
         return out.float32()
-
-
-def load_metadata(path):
-    path = Path(path)
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text())

@@ -12,7 +12,7 @@ class EmptyModule(nn.Module):
 
 
 class FeatureExtraction(nn.Module):
-    def __init__(self, d_in=0, d_out=32, n_cls=3, nsample=16, stride_list=None, architecture=None):
+    def __init__(self, d_in=0, d_out=32, n_cls=3, nsample=16, stride_list=None):
         super().__init__()
         if stride_list is None:
             stride_list = [4, 3, 2, 1]
@@ -64,14 +64,13 @@ class FeatureExtraction(nn.Module):
             dims = [(108, 512), (72, 384), (48, 256), (32, 192)]
             if decoder_idx < len(dims):
                 feature_dim, codebook_size = dims[decoder_idx]
-                self.codebooks.append(CodebookModule(feature_dim=feature_dim, codebook_size=codebook_size, commitment_cost=0, temperature=0.1))
+                self.codebooks.append(CodebookModule(feature_dim=feature_dim, codebook_size=codebook_size, temperature=0.1))
             else:
                 self.codebooks.append(EmptyModule())
 
-    def execute(self, p, x, o, calculate_commitment_losses=False):
+    def execute(self, p, x, o):
         batch_size = p.shape[0]
         p_from_encoder, x_from_encoder, o_from_encoder, idx_from_encoder = [], [], [], []
-        total_commitment_loss = jt.array(0.0, dtype=jt.float32)
         for block in self.encoder_blocks:
             p, x, o, idx = block(p.reshape(-1, 3), x, o)
             p_from_encoder.append(p)
@@ -92,7 +91,7 @@ class FeatureExtraction(nn.Module):
             codebook = self.codebooks[codebook_idx] if codebook_idx < len(self.codebooks) else None
             if isinstance(codebook, EmptyModule):
                 codebook = None
-            p, x, o, loss = block(
+            p, x, o = block(
                 p1=p_skip,
                 x1=x_skip,
                 o1=o_skip,
@@ -102,12 +101,10 @@ class FeatureExtraction(nn.Module):
                 o2=o,
                 batch_size=o_skip.shape[0],
                 codebook=codebook,
-                calculate_commitment_loss_for_block=calculate_commitment_losses,
             )
-            total_commitment_loss += loss
 
         x = nn.relu(self.linear0_1(x))
         x = nn.relu(self.linear0_2(x))
         x_out = jt.tanh(self.linear0_3(x))
         final_n = x.shape[0] // batch_size
-        return x_out.reshape(batch_size, final_n, -1), total_commitment_loss
+        return x_out.reshape(batch_size, final_n, -1)

@@ -10,7 +10,7 @@ def _to_numpy(x):
     return np.asarray(x, dtype=np.float32)
 
 
-def make_patches_for_pcl_pair(pcl_A, pcl_B, patch_size, num_patches, ratio):
+def make_patches_for_pcl_pair(pcl_A, pcl_B, patch_size, num_patches):
     pcl_A = _to_numpy(pcl_A).astype(np.float32)
     pcl_B = _to_numpy(pcl_B).astype(np.float32)
     n = pcl_A.shape[0]
@@ -24,11 +24,9 @@ def make_patches_for_pcl_pair(pcl_A, pcl_B, patch_size, num_patches, ratio):
 
 
 class PairedPatchDataset:
-    def __init__(self, datasets, split="train", patch_size=1000, num_patches=1000, patch_ratio=1.0, on_the_fly=True, transform=None):
+    def __init__(self, datasets, patch_size=1000, num_patches=1000, transform=None):
         self.datasets = datasets
-        self.split = split
         self.len_datasets = sum(len(dset) for dset in datasets)
-        self.patch_ratio = patch_ratio
         self.patch_size = patch_size
         self.num_patches = num_patches
         self.transform = transform
@@ -44,7 +42,6 @@ class PairedPatchDataset:
             pcl_data["pcl_clean"],
             patch_size=self.patch_size,
             num_patches=1,
-            ratio=self.patch_ratio,
         )
         data = {
             "pcl_noisy": pat_noisy[0],
