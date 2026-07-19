@@ -33,8 +33,8 @@ def relative_output_path(input_root, noisy_path):
 def denoise_one(model, noisy, args):
     noisy_norm, center, scale = NormalizeUnitSphere.normalize_np(noisy.astype(np.float32))
     pred = noisy_norm.astype(np.float32)
-    for _ in range(args.niters):
-        pred = patch_based_denoise_lowmem(model, pred, args)
+    den = patch_based_denoise_lowmem(model, pred, args)
+    pred = pred + float(args.pred_weight) * (den - pred)
     denoised = pred * scale + center
     return denoised.astype(np.float32)
 
@@ -53,15 +53,15 @@ def patch_based_denoise_lowmem(model, pcl_np, args):
 
     denom = np.maximum(patch_dists[:, -1:], 1e-12)
     patch_dists = patch_dists / denom
-    all_dists = np.full((num_patches, n), np.inf, dtype=np.float32)
-    for pi in range(num_patches):
-        all_dists[pi, point_idxs[pi]] = patch_dists[pi]
-    best_patch = np.argmin(all_dists, axis=0).astype(np.int64)
-
     patch_step = int(n / (args.seed_k_alpha * patch_size))
     patch_step = max(patch_step, int(args.patch_batch_size))
     if patch_step <= 0:
         raise ValueError("seed_k_alpha needs to be decreased to increase patch_step")
+
+    all_dists = np.full((num_patches, n), np.inf, dtype=np.float32)
+    for pi in range(num_patches):
+        all_dists[pi, point_idxs[pi]] = patch_dists[pi]
+    best_patch = np.argmin(all_dists, axis=0).astype(np.int64)
 
     patches_denoised = []
     with jt.no_grad():
@@ -115,7 +115,11 @@ def main():
     parser.add_argument("--seed-k", type=int, default=6)
     parser.add_argument("--seed-k-alpha", type=float, default=5)
     parser.add_argument("--patch-batch-size", type=int, default=8)
-    parser.add_argument("--niters", type=int, default=2)
+    parser.add_argument("--pred-weight", type=float, default=1.0)
+    parser.add_argument("--pgd-two-stage", dest="pgd_two_stage", action="store_true")
+    parser.add_argument("--pgd-second-stage-scale", dest="pgd_second_stage_scale", type=float, default=1.0)
+    parser.add_argument("--pgd-use-refine-gate", dest="pgd_use_refine_gate", action="store_true")
+    parser.add_argument("--pgd-refine-gate-scale", dest="pgd_refine_gate_scale", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--use-cuda", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -144,7 +148,7 @@ def main():
     if not noisy_paths:
         raise FileNotFoundError(f"No noisy.npy files under {input_root}")
 
-    model = PGDModel.load_from_npz(args.weights)
+    model = PGDModel.load_from_npz(args.weights, args=args)
     metadata = vars(args).copy()
     metadata["input_root"] = str(input_root)
     metadata["output_root"] = str(output_root)
@@ -182,3 +186,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
