@@ -1245,3 +1245,175 @@ A6 是本轮第一个随训练长度增加而持续提高 CD 和总 score、且 
 统一选择门槛保持不变：固定 train-only holdout 上 CD 与最终 score 必须同时
 提高，P2S 不得实质退化；早筛目标为 score 至少 `+0.3`。只有通过该门槛的
 候选才扩到 26-shape，随后才允许一次完整 100-shape validate。
+
+#### A6-300 + fixed tangent transport：6-shape gate 通过
+
+已完成固定配置 `PCA strength=0.15` + `k=8, margin=0.85,
+step=0.125` 单步 tangent repulsion。全部操作只读取 A6 预测和 noisy cloud，
+不读取 GT，不改变点数。
+
+| 分支 | CD | P2S | score |
+|---|---:|---:|---:|
+| 原 baseline | `60.35` | `92.05` | `76.20` |
+| A6-300 raw | `60.49` | `92.04` | `76.27` |
+| A6-300 + PCA + tangent | **`61.04`** | **`92.05`** | **`76.54`** |
+
+组合相对原 baseline 为 CD `+0.69`、P2S 持平、总 score `+0.34`；相对
+A6-300 raw 为 CD `+0.55`、P2S `+0.01`、score `+0.27`。这是本轮第一个
+通过 6-shape `+0.3` 双提升门槛的候选，下一步扩大到固定 26-shape
+train holdout；在 26-shape 确认前不运行完整 validate。
+
+#### A6-300 + fixed tangent transport：26-shape 与完整验证结果
+
+冻结 6-shape 上选出的全部参数，不在 26-shape 或 validate 上继续调参：
+
+- PCA projection：`k=16, strength=0.15`
+- tangent repulsion：`k=8, margin=0.85, step=0.125, iterations=1`
+- tangent normal source：`pred`
+
+固定 26-shape train-only holdout 结果：
+
+| 分支 | CD | P2S | score |
+|---|---:|---:|---:|
+| 原 baseline | `63.98` | `92.09` | `78.03` |
+| A6-300 raw | `64.09` | `92.06` | `78.08` |
+| A6-300 + PCA + tangent | **`64.60`** | **`92.10`** | **`78.35`** |
+
+最终组合相对 baseline 为 CD `+0.62`、P2S `+0.01`、score `+0.32`，
+通过扩大门槛。
+
+完整 100-shape validate 使用同一固定配置、同一 `seed=8200` reference
+样本和官方 evaluator。为拆分网络与几何后处理的贡献，保留并分别评分了
+raw 与最终输出：
+
+| 分支 | CD | P2S | score | 相对原 baseline |
+|---|---:|---:|---:|---:|
+| 原正式 baseline | `65.35` | `91.68` | `78.52` | — |
+| A6-300 raw | `65.40` | `91.62` | `78.51` | CD `+0.05`，P2S `-0.06`，score `-0.01` |
+| A6-300 + PCA + tangent | **`65.89`** | **`91.64`** | **`78.76`** | CD `+0.54`，P2S `-0.04`，score `+0.24` |
+
+因此完整集上的提升不能归因于 A6 续训本身：A6 raw 只轻微提高 CD，
+但 P2S 的下降刚好抵消了它。最终增益主要来自固定几何后处理；相对 A6 raw，
+PCA+tangent 提供 CD `+0.49`、P2S `+0.02`、score `+0.25`。A6 的价值更
+准确地说是提供了一个可被 surface/tangent stabilization 有效修正的预测，
+而不是单独成为更高分 checkpoint。
+
+对应产物：
+
+- A6 raw：`experiments/score82_a6_full_stage2/full100_round300`
+- 最终输出：
+  `experiments/score82_a6_full_stage2/full100_round300_pca015_tangent125`
+- 官方完整集日志：
+  `experiments/score82_a6_full_stage2/full100_round300_pca015_tangent125/evaluate.log`
+
+后续继续提分时，以最终组合 score `78.76` 为正式结果，但候选选择仍只在
+train-only holdout 上进行。优先级调整为：
+
+1. 先优化 geometry stabilization 的局部置信度与自适应步长，目标是在保留
+   当前 CD 增益的同时收回完整集 P2S 的 `0.04`；
+2. 再做 A6 `300→600/900` steps、低学习率 continuation 和 Stage2 EMA/SWA，
+   但必须同时检查 raw 与“raw+固定后处理”，不能再用 raw 的短集趋势推断
+   完整集总分；
+3. 之后训练 edge-aware tangent gate，只在高 planarity、高法向一致性的
+   平滑区开放 transport；
+4. 最后再尝试训练期 `6000-context/1500-core` 与 overlap consistency。
+
+#### A6 最终测试集包
+
+使用完整验证最佳的冻结配置在 `/home/dataset_test_noisy` 全部 200 个测试
+样本上生成提交：
+
+- A6-300 independent Stage2，`patch_size=1500, seed_k=7,
+  seed_k_alpha=10, two_stage_scale=0.5, refine_gate_scale=0.25`
+- PCA：`k=16, strength=0.15`
+- tangent：`k=8, margin=0.85, step=0.125, iterations=1,
+  normal_source=pred`
+- 提交文件：`/home/PGD/result.zip`
+- zip 内文件数：`200`
+- 所有输入/输出 shape：`(50000, 3)`，不一致数 `0`
+- dtype：全部 `float32`；NaN/Inf 数 `0`
+- zip CRC：通过
+- SHA256：
+  `6ddb17d887b3368bf0e7ccdcdbc21f6f7b863fec9ee32282bbf62126347d37cc`
+
+该包只包含 `shapenet/<category>/<model>/denoised.npy`，没有 GT、noisy 或
+额外元数据。测试集没有本地 GT，因此实际测试 score 只能由平台返回。
+
+## 非 Stage2 几何主线复核与新最佳（2026-07-28）
+
+完整验证贡献复核确认 A6 不是有效增益来源。将完全相同的固定
+`PCA+tangent` 后处理接到原始 plain-InfoCD baseline 后，得到 score
+`78.78`，略高于 A6 加后处理的 `78.76`。因此 A6 作为失败消融保留，
+后续起点切回原始 checkpoint：
+
+`experiments/score82_plain_infocd_lr/lr5e6/pgd-shapenet-epoch00-loss4.52375959.npz`
+
+同一完整 100-shape、seed `8200`、50k mesh 协议的贡献拆分如下：
+
+| 分支 | CD | P2S | score | pred→GT | GT→pred |
+|---|---:|---:|---:|---:|---:|
+| baseline raw | `65.35` | `91.68` | `78.52` | `3.53962e-5` | `3.20160e-5` |
+| PCA only (`k16,s=0.15`) | `65.41` | `91.85` | `78.63` | `3.50193e-5` | `3.21519e-5` |
+| tangent only (`k8,step=0.125`) | `65.78` | `91.53` | `78.65` | `3.56940e-5` | `3.08789e-5` |
+| fixed PCA + tangent | `65.85` | `91.71` | `78.78` | `3.52970e-5` | `3.09956e-5` |
+| A6 raw | `65.40` | `91.62` | `78.51` | `3.54837e-5` | `3.18046e-5` |
+| A6 + fixed PCA + tangent | `65.89` | `91.64` | `78.76` | `3.53767e-5` | `3.08152e-5` |
+
+数据表明 PCA 主要改善连续表面贴合（P2S 和 pred→GT），但轻微损伤
+GT→pred 覆盖；tangent 则显著改善覆盖，但会损伤 P2S 和 pred→GT。
+固定组合的增益主要来自 GT→pred（相对 raw 下降约 `3.19%`），而
+pred→GT 仅下降约 `0.28%`。因此剩余瓶颈不是继续加强全局排斥，而是只在
+可靠局部平面开放 coverage transport。
+
+### 曲率门控 tangent transport
+
+`tools/postprocess_tangent_repulsion.py` 新增无 GT 的局部表面置信度。局部
+协方差特征值定义 surface variation
+`lambda_min / (lambda_0 + lambda_1 + lambda_2)`；最终 transport 乘以
+`exp(-variation / tau)`。固定 26-shape 训练侧 holdout 选择结果：
+
+| 分支 | CD | P2S | score |
+|---|---:|---:|---:|
+| fixed PCA + fixed tangent | `64.16` | `91.77` | `77.96` |
+| fixed PCA + curvature-gated tangent | **`64.31`** | **`91.87`** | **`78.09`** |
+
+冻结 winner 参数 `k=8, margin=0.85, step=0.25, iterations=1,
+normal_source=pred, variation_tau=0.02` 后，完整验证得到：
+
+| 分支 | CD | P2S | score | pred→GT | GT→pred |
+|---|---:|---:|---:|---:|---:|
+| fixed PCA + fixed tangent | `65.85` | `91.71` | `78.78` | `3.52970e-5` | `3.09956e-5` |
+| fixed PCA + gated tangent | **`66.04`** | **`91.80`** | **`78.92`** | **`3.52247e-5`** | **`3.06955e-5`** |
+
+相对固定后处理，CD、P2S、score 三项同时提高；100 个样本中 99 个
+score 提高、99 个 CD 提高。局部间距诊断显示 tangent 的有效作用是减少
+严重塌缩边（固定 noisy-KNN 图上 ratio `<0.70` 的比例约从 `15.9%`
+降至 `14.2%`），而不是扩大整体点间距。
+
+### 法向一致性门控 PCA + 曲率门控 tangent（当前最佳）
+
+`tools/postprocess_pca_projection.py` 同步新增无 GT 的法向一致性门控：
+每点置信度由邻域 PCA 法向绝对内积均值计算。固定 26-shape 训练侧
+holdout 上，接同一 gated tangent 后：
+
+| PCA | CD | P2S | score |
+|---|---:|---:|---:|
+| fixed `strength=0.15` | `64.65` | `92.23` | `78.44` |
+| consistency gate, `strength=0.22` | **`64.69`** | **`92.24`** | **`78.47`** |
+
+冻结 `PCA k=16, strength=0.22, consistency_floor=0.75`，再接上述 curvature
+tangent winner，完整验证最终为：
+
+| Metric | 当前最佳 | 相对 raw | 相对 fixed PCA+tangent |
+|---|---:|---:|---:|
+| CD score | **`66.09`** | `+0.74` | `+0.24` |
+| P2S score | **`91.83`** | `+0.15` | `+0.12` |
+| final score | **`78.96`** | `+0.44` | `+0.18` |
+| pred→GT | **`3.51935e-5`** | `-0.57%` | `-0.29%` |
+| GT→pred | **`3.06143e-5`** | `-4.38%` | `-1.23%` |
+
+完整输出位于
+`experiments/score82_adaptive_pca/full100_cons075_s220_var020_s250`。
+全部后处理保持输入点数和索引数不变，推理不读取 GT。下一轮优先研究
+多尺度 robust MLS / edge confidence，以及让网络训练期直接预测同类
+surface confidence；不再把 Stage2 结构本身作为前置条件。

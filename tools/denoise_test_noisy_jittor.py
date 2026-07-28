@@ -117,6 +117,12 @@ def main():
     parser.add_argument("--patch-batch-size", type=int, default=8)
     parser.add_argument("--pred-weight", type=float, default=1.0)
     parser.add_argument("--pgd-two-stage", dest="pgd_two_stage", action="store_true")
+    parser.add_argument(
+        "--pgd-use-separate-stage2",
+        dest="pgd_use_separate_stage2",
+        action="store_true",
+        help="use the independently trained Stage-2 backbone stored in A6 checkpoints",
+    )
     parser.add_argument("--pgd-second-stage-scale", dest="pgd_second_stage_scale", type=float, default=1.0)
     parser.add_argument("--pgd-use-refine-gate", dest="pgd_use_refine_gate", action="store_true")
     parser.add_argument("--pgd-refine-gate-scale", dest="pgd_refine_gate_scale", type=float, default=0.25)
@@ -155,7 +161,12 @@ def main():
     metadata["num_files"] = len(noisy_paths)
     metadata["framework"] = "jittor"
     metadata["load_report"] = getattr(model, "_load_report", {})
-    with open(output_root / "metadata.json", "w") as f:
+    metadata_name = (
+        "metadata.json"
+        if args.num_shards == 1
+        else "metadata_shard{:02d}.json".format(args.shard_index)
+    )
+    with open(output_root / metadata_name, "w") as f:
         json.dump(metadata, f, indent=2)
 
     for noisy_path in tqdm(noisy_paths, desc="Denoise test noisy"):
@@ -178,10 +189,15 @@ def main():
         "shape_mismatches": mismatches,
         "nonfinite_or_invalid": nonfinite,
     }
-    with open(output_root / "count_check.json", "w") as f:
+    count_name = (
+        "count_check.json"
+        if args.num_shards == 1
+        else "count_check_shard{:02d}.json".format(args.shard_index)
+    )
+    with open(output_root / count_name, "w") as f:
         json.dump(report, f, indent=2)
     if missing or mismatches or nonfinite:
-        raise RuntimeError(f"Output verification failed; see {output_root / 'count_check.json'}")
+        raise RuntimeError(f"Output verification failed; see {output_root / count_name}")
 
 
 if __name__ == "__main__":
