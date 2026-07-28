@@ -27,7 +27,17 @@ class StartBlock(nn.Module):
         )
 
     def execute(self, p, x, o):
-        return p, self.mlp(p), o, None
+        # The original PGD backbone has no input features and therefore uses
+        # coordinates alone.  Keep that path exactly unchanged, while allowing
+        # feature-conditioned variants (for example a cross-stage displacement
+        # refiner) to concatenate their per-point input at the first layer.
+        if x is None:
+            x_in = p
+        else:
+            if len(x.shape) > 2:
+                x = x.reshape(-1, x.shape[-1])
+            x_in = jt.concat([p, x], dim=1)
+        return p, self.mlp(x_in), o, None
 
 
 class Downsampling(nn.Module):

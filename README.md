@@ -107,9 +107,22 @@ files.
 ### ShapeNet one-epoch training
 
 This is the current documented CUDA/Jittor training path. It follows the
-starter-code datalist split, loads meshes from `/home/dataset_train`, samples
-`10000` points per mesh, and adds Gaussian noise whose standard deviation is
-sampled uniformly from `[0.005, 0.020]`.
+starter-code datalist split, uses `/home/dataset_train`, samples `50000` clean
+points per mesh, and adds Gaussian noise whose standard deviation is sampled
+uniformly from `[0.005, 0.020]`.
+
+For faster training, pre-sample the clean point clouds once and train from the
+generated `.npy` files instead of re-reading OBJ meshes every batch:
+
+```bash
+cd /home/PGD
+conda activate jittor
+python3.7 tools/prepare_shapenet_points.py \
+  --dataset_root /home/dataset_train \
+  --datalist_dir /home/PGD/datalist \
+  --sample_points 50000 \
+  --output_dir /home/dataset_train_pgd_points_50k
+```
 
 ```bash
 cd /home/PGD
@@ -123,25 +136,44 @@ python3.7 tools/train_shapenet_one_epoch.py \
   --use_cuda \
   --dataset_root /home/dataset_train \
   --datalist_dir /home/PGD/datalist \
-  --sample_points 10000 \
+  --sample_points 50000 \
+  --precomputed_points_dir /home/dataset_train_pgd_points_50k \
   --noise_std_min 0.005 \
   --noise_std_max 0.020 \
   --patch_size 1000 \
+  --patches_per_shape 4 \
   --batch_size 24 \
   --loss infocd \
+  --eval_after_epoch \
   --epochs 1 \
-  --log_dir /home/PGD/experiments/shapenet_10k_gaussian_005_020_one_epoch
+  --log_dir /home/PGD/experiments/shapenet_50k_gaussian_005_020
 ```
 
 Background launch with logging:
 
 ```bash
-mkdir -p /home/PGD/experiments/shapenet_10k_gaussian_005_020_one_epoch
-setsid bash -c 'cd /home/PGD; export CUDA_VISIBLE_DEVICES=3; export cache_name=pgd_cuda; export nvcc_path=/usr/local/cuda/bin/nvcc; export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/root/miniconda3/envs/jittor/lib:$LD_LIBRARY_PATH; exec python3.7 tools/train_shapenet_one_epoch.py --use_cuda --dataset_root /home/dataset_train --datalist_dir /home/PGD/datalist --sample_points 10000 --noise_std_min 0.005 --noise_std_max 0.020 --patch_size 1000 --batch_size 24 --loss infocd --epochs 1 --log_dir /home/PGD/experiments/shapenet_10k_gaussian_005_020_one_epoch >> /home/PGD/experiments/shapenet_10k_gaussian_005_020_one_epoch/train.log 2>&1' &
+mkdir -p /home/PGD/experiments/shapenet_50k_gaussian_005_020
+setsid bash -c 'cd /home/PGD; export CUDA_VISIBLE_DEVICES=3; export cache_name=pgd_cuda; export nvcc_path=/usr/local/cuda/bin/nvcc; export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/root/miniconda3/envs/jittor/lib:$LD_LIBRARY_PATH; exec python3.7 tools/train_shapenet_one_epoch.py --use_cuda --dataset_root /home/dataset_train --datalist_dir /home/PGD/datalist --sample_points 50000 --precomputed_points_dir /home/dataset_train_pgd_points_50k --noise_std_min 0.005 --noise_std_max 0.020 --patch_size 1000 --patches_per_shape 4 --batch_size 24 --loss infocd --eval_after_epoch --epochs 1 --log_dir /home/PGD/experiments/shapenet_50k_gaussian_005_020 >> /home/PGD/experiments/shapenet_50k_gaussian_005_020/train.log 2>&1' &
 ```
 
 `--loss infocd` uses the Jittor implementation in `models/InfoCD.py`.
 `--loss chamfer` is available only as an explicit debug fallback.
+Omit `--precomputed_points_dir` only when you intentionally want slower
+on-the-fly OBJ sampling.
+
+MPI multi-GPU training is available after installing OpenMPI. On this machine,
+use CPU MPI gradient all-reduce (`use_nccl=0`) because the NCCL device path
+currently reports an `unhandled system error`. The launch follows Jittor's
+official distributed pattern, `mpirun -np <N> python ...`; this project wraps
+the Python command with `tools/mpi_rank_cuda_wrapper.sh` so each local rank sees
+one GPU from `PGD_MPI_DEVICES`.
+`--eval_after_epoch` writes per-epoch validation scores under
+`<log_dir>/eval_epochXX/` and records parsed scores in `history.json`.
+
+```bash
+mkdir -p /home/PGD/experiments/shapenet_50k_gaussian_005_020_mpi
+setsid bash -c 'cd /home/PGD; export PGD_MPI_DEVICES=0,1,3,4,5,6; export cache_name=pgd_cuda_mpi; export nvcc_path=/usr/local/cuda/bin/nvcc; export use_nccl=0; export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/root/miniconda3/envs/jittor/lib:/root/miniconda3/envs/jittor/lib/python3.7/site-packages/nvidia/cudnn/lib:/root/miniconda3/envs/jittor/targets/x86_64-linux/lib:$LD_LIBRARY_PATH; exec mpirun --allow-run-as-root --quiet -np 6 tools/mpi_rank_cuda_wrapper.sh /root/miniconda3/envs/jittor/bin/python3.7 tools/train_shapenet_one_epoch.py --use_cuda --dataset_root /home/dataset_train --datalist_dir /home/PGD/datalist --sample_points 50000 --precomputed_points_dir /home/dataset_train_pgd_points_50k --noise_std_min 0.005 --noise_std_max 0.020 --patch_size 1000 --patches_per_shape 4 --batch_size 24 --loss infocd --eval_after_epoch --epochs 5 --start_epoch 4 --init_weights /home/PGD/experiments/shapenet_10k_gaussian_005_020_one_epoch/pgd-shapenet-epoch03-loss5.37268828.npz --log_dir /home/PGD/experiments/shapenet_50k_gaussian_005_020_mpi >> /home/PGD/experiments/shapenet_50k_gaussian_005_020_mpi/train.log 2>&1' &
+```
 
 ### Generic PUNet-style training
 
@@ -194,16 +226,59 @@ python3.7 test.py \
 
 ## Evaluation
 
-Run `evaluate.py` on a produced output directory. The evaluator expects
-predicted `.xyz` files, matching ground-truth `.xyz` files, and matching mesh
-`.off` files.
+For the ShapeNet validation split used in this project, run mesh-based val
+evaluation from `/home/dataset_train` with `tools/eval_shapenet_mesh_val.py`.
+This script reads OBJ meshes from `/home/dataset_train`, samples clean
+points per validation mesh, normalizes each sampled point cloud to the unit
+sphere, adds Gaussian noise with per-sample standard deviation uniformly sampled
+from `[0.005, 0.020]`, runs PGD denoising, restores points to the original mesh
+coordinate frame, and calls `/home/starter_code/evaluate.py` for CD/P2S scoring.
+
+Example using the latest available continued-training checkpoint:
 
 ```bash
-python3.7 evaluate.py \
-  --pred_dir ./experiments/results/PGD/PUNet_Ours__50000_poisson_0.03 \
-  --gt_dir ./data/gt_xyz \
-  --mesh_dir ./data/meshes_off \
-  --out ./experiments/results/PGD/PUNet_Ours__50000_poisson_0.03_eval.json
+cd /home/PGD
+export CUDA_VISIBLE_DEVICES=3
+export cache_name=pgd_cuda
+export nvcc_path=/usr/local/cuda/bin/nvcc
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/root/miniconda3/envs/jittor/lib:/root/miniconda3/envs/jittor/lib/python3.7/site-packages/nvidia/cudnn/lib:/root/miniconda3/envs/jittor/targets/x86_64-linux/lib:$LD_LIBRARY_PATH
+
+python3.7 tools/eval_shapenet_mesh_val.py \
+  --use_cuda \
+  --weights /home/PGD/experiments/shapenet_10k_gaussian_005_020_one_epoch/pgd-shapenet-epoch03-loss5.37268828.npz \
+  --dataset_root /home/dataset_train \
+  --val_list /home/PGD/datalist/validate.txt \
+  --sample_points 10000 \
+  --noise_std_min 0.005 \
+  --noise_std_max 0.020 \
+  --patch_size 1000 \
+  --seed_k 5 \
+  --seed_k_alpha 10 \
+  --patch_batch_size 8 \
+  --niters 1 \
+  --workers 8 \
+  --run_evaluate \
+  --output_root /home/PGD/experiments/mesh_val_eval_epoch03_10k_noise005_020
+```
+
+The latest recorded run produced `CD=33.33`, `P2S=69.84`, and final score
+`51.59` on 100 validation samples. Outputs are under
+`experiments/mesh_val_eval_epoch03_10k_noise005_020/`, with `evaluate.log`,
+`count_check.json`, and generated `pred/`, `gt/`, and `noisy/` directories.
+
+For generic pre-produced outputs, run `evaluate.py` directly. The evaluator
+expects predicted point cloud files, matching ground-truth files, matching noisy
+files, and optional matching mesh files.
+
+```bash
+python3.7 /home/starter_code/evaluate.py \
+  --pred_dir ./experiments/some_eval/pred \
+  --gt_dir ./experiments/some_eval/gt \
+  --noisy_dir ./experiments/some_eval/noisy \
+  --mesh_dir /home/dataset_train \
+  --pred_filename denoised.npy \
+  --gt_filename clean.npy \
+  --noisy_filename noisy.npy
 ```
 
 ## Notes for Development

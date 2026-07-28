@@ -6,9 +6,30 @@ The local regression baseline is the complete 100-shape validation result:
 - CD: `66.44`
 - P2S: `91.78`
 - checkpoint: `experiments/pgd_normalcorr_continue400_from7908/pgd-shapenet-epoch00-loss4.53743574.npz`
+- absolute checkpoint path: `/home/PGD/experiments/pgd_normalcorr_continue400_from7908/pgd-shapenet-epoch00-loss4.53743574.npz`
+
+This is the fixed baseline weight for future experiments. Its configured loss
+was `infocd` with `loss_corr_weight=1.0`,
+`loss_relative_weight=0.5`, `loss_infocd_weight=0.15`,
+`loss_uniform_weight=0.1`, `loss_stage_weight=0.2`, and
+`corr_huber_delta=0.01`. Crucially, it enabled
+`pgd_use_normal_corr_loss=true`, using normal/tangent correction weights
+`2.0/1.0`; the training data used 50,000 points, Gaussian noise std sampled
+from `[0.005, 0.020]`, `patch_size=1500`, four patches per shape, and seed
+`2032`. However, the baseline also had `pgd_composite_loss=false`, so the
+normal-correction branch was not active in the effective objective: the
+actual optimized loss was the plain Jittor InfoCD loss. Runs intended to be
+comparable must keep `--pgd_composite_loss` disabled; enabling the normal
+flag alone only computes unused training normals and adds overhead.
 
 The platform test result (`79.61`) is recorded separately and is not used to
 select local changes because the test ground truth is unavailable.
+
+The current from-scratch training main flow is documented in
+[`TRAINING_RUNBOOK.md`](TRAINING_RUNBOOK.md#current-main-training-flow). It
+keeps this baseline's architecture and effective loss, but uses Adam
+warmup+cosine learning-rate scheduling instead of the baseline's low-LR
+continuation setup.
 
 ## Kept inference path
 

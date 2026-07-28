@@ -3,7 +3,7 @@ os.environ.setdefault("nvcc_path", "")
 import jittor as jt
 from jittor import nn
 
-from models.blocks import block_decider, CodebookModule
+from models.blocks import block_decider, CodebookModule, FiLMLayer
 
 
 class EmptyModule(nn.Module):
@@ -12,8 +12,20 @@ class EmptyModule(nn.Module):
 
 
 class FeatureExtraction(nn.Module):
-    def __init__(self, d_in=0, d_out=32, n_cls=3, nsample=16, stride_list=None):
+    def __init__(
+        self,
+        d_in=0,
+        d_out=32,
+        n_cls=3,
+        nsample=16,
+        stride_list=None,
+        cond_dim=0,
+        return_features=False,
+        use_codebook=False,
+    ):
         super().__init__()
+        self.return_features = return_features
+        self.use_codebook = use_codebook
         if stride_list is None:
             stride_list = [4, 3, 2, 1]
         architecture = [
@@ -52,12 +64,15 @@ class FeatureExtraction(nn.Module):
                 self.encoder_blocks.append(block_decider(block_name)(d_prev, d_out, nsample, stride))
             d_prev = d_out
 
-        self.linear0_1 = nn.Linear(d_out, 128, bias=False)
-        self.linear0_2 = nn.Linear(128, 64)
-        self.linear0_3 = nn.Linear(64, n_cls)
+        self.feature_dim = d_out
+        self.condition_film = FiLMLayer(cond_dim, d_out) if cond_dim > 0 else None
+        if not self.return_features:
+            self.linear0_1 = nn.Linear(d_out, 128, bias=False)
+            self.linear0_2 = nn.Linear(128, 64)
+            self.linear0_3 = nn.Linear(64, n_cls)
         self.codebooks = nn.ModuleList()
         for i in range(len(architecture)):
-            if i < 5:
+            if not self.use_codebook or i < 5:
                 self.codebooks.append(EmptyModule())
                 continue
             decoder_idx = i - 5
@@ -68,7 +83,23 @@ class FeatureExtraction(nn.Module):
             else:
                 self.codebooks.append(EmptyModule())
 
-    def execute(self, p, x, o):
+    def project_features(self, x):
+        """Project decoded point features to a bounded displacement.
+
+        Keeping this small head separate lets flow-style models reuse the
+        decoded features for a distance estimator without running the
+        encoder/decoder backbone a second time.
+        """
+        if not hasattr(self, "linear0_1"):
+            raise RuntimeError("FeatureExtraction was constructed for feature output only")
+        batch_size, point_count, feature_dim = x.shape
+        x = x.reshape(batch_size * point_count, feature_dim)
+        x = nn.relu(self.linear0_1(x))
+        x = nn.relu(self.linear0_2(x))
+        x = jt.tanh(self.linear0_3(x))
+        return x.reshape(batch_size, point_count, -1)
+
+    def execute(self, p, x, o, cond=None, return_features=None):
         batch_size = p.shape[0]
         p_from_encoder, x_from_encoder, o_from_encoder, idx_from_encoder = [], [], [], []
         for block in self.encoder_blocks:
@@ -103,8 +134,14 @@ class FeatureExtraction(nn.Module):
                 codebook=codebook,
             )
 
-        x = nn.relu(self.linear0_1(x))
-        x = nn.relu(self.linear0_2(x))
-        x_out = jt.tanh(self.linear0_3(x))
         final_n = x.shape[0] // batch_size
-        return x_out.reshape(batch_size, final_n, -1)
+        if self.condition_film is not None and cond is not None:
+            gamma, beta = self.condition_film(cond)
+            gamma = gamma.unsqueeze(1).broadcast((batch_size, final_n, gamma.shape[-1])).reshape(batch_size * final_n, -1)
+            beta = beta.unsqueeze(1).broadcast((batch_size, final_n, beta.shape[-1])).reshape(batch_size * final_n, -1)
+            x = x * (1.0 + gamma) + beta
+
+        use_feature_output = self.return_features if return_features is None else return_features
+        if use_feature_output:
+            return x.reshape(batch_size, final_n, -1)
+        return self.project_features(x.reshape(batch_size, final_n, -1))

@@ -6,6 +6,8 @@ os.environ.setdefault("nvcc_path", "")
 import numpy as np
 import jittor as jt
 
+from utils.noise import DEFAULT_NOISE_TYPES, add_jittor_noise
+
 
 class Compose:
     def __init__(self, transforms):
@@ -43,14 +45,16 @@ class NormalizeUnitSphere:
 
 
 class AddNoise:
-    def __init__(self, noise_std_min, noise_std_max):
+    def __init__(self, noise_std_min, noise_std_max, noise_types=DEFAULT_NOISE_TYPES):
         self.noise_std_min = noise_std_min
         self.noise_std_max = noise_std_max
+        self.noise_types = noise_types
 
     def __call__(self, data):
         noise_std = random.uniform(self.noise_std_min, self.noise_std_max)
-        data["pcl_noisy"] = data["pcl_clean"] + jt.randn(data["pcl_clean"].shape) * noise_std
+        data["pcl_noisy"], noise_type = add_jittor_noise(data["pcl_clean"], noise_std, self.noise_types)
         data["noise_std"] = noise_std
+        data["noise_type"] = noise_type
         return data
 
 
@@ -91,10 +95,10 @@ class RandomRotate:
         return data
 
 
-def standard_train_transforms(noise_std_min, noise_std_max, rotate=True, scale_d=0):
+def standard_train_transforms(noise_std_min, noise_std_max, rotate=True, scale_d=0, noise_types=DEFAULT_NOISE_TYPES):
     transforms = [
         NormalizeUnitSphere(),
-        AddNoise(noise_std_min=noise_std_min, noise_std_max=noise_std_max),
+        AddNoise(noise_std_min=noise_std_min, noise_std_max=noise_std_max, noise_types=noise_types),
         RandomScale([1 - scale_d, 1 + scale_d]),
     ]
     if rotate:

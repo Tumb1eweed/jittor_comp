@@ -37,7 +37,34 @@ def test_normal_tangent_corr_loss_weights_normal_errors_more():
     np.testing.assert_allclose(tangent_loss, 1.0, atol=1e-6)
 
 
+def test_relative_normal_tangent_corr_is_noisy_normalized_per_sample():
+    clean = jt.zeros((2, 2, 3), dtype=jt.float32)
+    normals = jt.array(np.asarray([
+        [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+    ], dtype=np.float32))
+    noisy = jt.array(np.asarray([
+        [[0.01, 0.00, 0.02], [0.01, 0.00, 0.02]],
+        [[0.04, 0.00, 0.08], [0.04, 0.00, 0.08]],
+    ], dtype=np.float32))
+
+    unchanged = float(normal_tangent_corr_loss(
+        noisy, clean, normals, noisy=noisy, relative=True
+    ).numpy())
+    halfway = float(normal_tangent_corr_loss(
+        noisy * 0.5, clean, normals, noisy=noisy, relative=True
+    ).numpy())
+    perfect = float(normal_tangent_corr_loss(
+        clean, clean, normals, noisy=noisy, relative=True
+    ).numpy())
+
+    np.testing.assert_allclose(unchanged, 1.0, atol=2e-5)
+    np.testing.assert_allclose(halfway, 0.25, atol=2e-5)
+    np.testing.assert_allclose(perfect, 0.0, atol=1e-7)
+
+
 if __name__ == "__main__":
     test_estimate_patch_normals_np_recovers_planar_normals()
     test_normal_tangent_corr_loss_weights_normal_errors_more()
+    test_relative_normal_tangent_corr_is_noisy_normalized_per_sample()
     os._exit(0)

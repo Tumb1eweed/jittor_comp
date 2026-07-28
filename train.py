@@ -16,6 +16,7 @@ from datasets.pcl import PointCloudDataset
 from datasets.patch import PairedPatchDataset
 from models.pgd import PGDModel
 from utils.misc import get_log_dir_name_tblogger, seed_all, str_list
+from utils.noise import DEFAULT_NOISE_TYPES, parse_noise_types
 from utils.transforms import standard_train_transforms
 
 
@@ -114,6 +115,7 @@ def main(args):
                 transform=standard_train_transforms(
                     noise_std_max=args.noise_max,
                     noise_std_min=args.noise_min,
+                    noise_types=args.noise_types,
                     rotate=args.aug_rotate,
                 ),
                 max_shapes=args.max_shapes,
@@ -162,6 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--resolutions", type=str_list, default=["10000_poisson", "30000_poisson", "50000_poisson"])
     parser.add_argument("--noise_min", type=float, default=0.005)
     parser.add_argument("--noise_max", type=float, default=0.02)
+    parser.add_argument("--noise_types", type=str, default=DEFAULT_NOISE_TYPES)
     parser.add_argument("--train_batch_size", type=int, default=20)
     parser.add_argument("--save_interval", type=int, default=5)
     parser.add_argument("--aug_rotate", type=eval, default=True, choices=[True, False])
@@ -181,4 +184,5 @@ if __name__ == "__main__":
     parser.add_argument("--no_mpi_sync_initial_params", dest="mpi_sync_initial_params", action="store_false")
     parser.add_argument("--mpi_scale_steps_by_world_size", action="store_true")
     args = parser.parse_args()
+    args.noise_types = ",".join(parse_noise_types(args.noise_types))
     main(args)
